@@ -10,6 +10,6 @@ jobs:
       - name: Install offline test dependencies
         run: |
           python3 -m venv .profile-test
-          .profile-test/bin/pip install munch==2.5.0 PyYAML==6.0.2 rich==13.9.4
+          .profile-test/bin/pip install setuptools==80.9.0 munch==2.5.0 PyYAML==6.0.2 rich==13.9.4
       - name: Qualify the historical profile extension
         run: .profile-test/bin/python tests/unit_tests/test_profile.py

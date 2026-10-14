@@ -19,7 +19,8 @@ and atomic replacement; a failed replacement preserves the existing profile.
 Symlink profiles and path traversal names are refused.
 
 Run `python3 tests/unit_tests/test_profile.py` with PyYAML, Rich, and Munch 2.5.0
-installed. These offline tests load the actual historical configuration class
+installed, plus Setuptools 80.9.0 for Munch's historical `pkg_resources` import.
+These offline tests load the actual historical configuration class
 and use isolated profile directories. They cover persistence, listing/showing,
 endpoint selection, CLI argument registration, failed writes, and refusal
 cases. They do not qualify the whole historical SDK or contact a live network.
