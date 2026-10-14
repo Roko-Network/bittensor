@@ -1,0 +1,15 @@
+name: Historical profile compatibility
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  profiles:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Install offline test dependencies
+        run: |
+          python3 -m venv .profile-test
+          .profile-test/bin/pip install setuptools==80.9.0 munch==2.5.0 PyYAML==6.0.2 rich==13.9.4
+      - name: Qualify the historical profile extension
+        run: .profile-test/bin/python tests/unit_tests/test_profile.py
