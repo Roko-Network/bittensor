@@ -1,129 +1,139 @@
-# Standard Library
-from copy import deepcopy
-from unittest.mock import patch, MagicMock, mock_open
+"""Offline regression checks using this fork's real config implementation."""
+import argparse
+import importlib.util
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-# 3rd Party
-import pytest
+import yaml
 
-# Bittensor
-from bittensor.commands.profile import ProfileCommand
-from bittensor import config as bittensor_config
-
-
-class MockDefaults:
-    profile = {
-        "name": "default",
-        "path": "~/.bittensor/profiles/",
-    }
+ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize(
-    "test_input,expected",
-    [
-        (
-            {
-                "name": "Alice",
-                "coldkey": "ckey",
-                "hotkey": "hkey",
-                "subtensor_network": "mainnet",
-                "active_netuid": "0",
-            },
-            "Alice",
-        ),
-        (
-            {
-                "name": "Bob",
-                "coldkey": "bckey",
-                "hotkey": "bhkey",
-                "subtensor_network": "test",
-                "active_netuid": "1",
-            },
-            "Bob",
-        ),
-    ],
-    ids=["happy-path-Alice", "happy-path-Bob"],
-)
-@patch("bittensor.commands.profile.Prompt")
-@patch("bittensor.commands.profile.ProfileCommand._write_profile")
-@patch("bittensor.commands.profile.defaults", MockDefaults)
-def test_run(mock_write_profile, mock_prompt, test_input, expected):
-    # Arrange
-    mock_cli = MagicMock()
-    mock_cli.config = deepcopy(bittensor_config())
-    mock_cli.config.path = "/fake/path/"
-    for attr, value in test_input.items():
-        setattr(mock_cli.config, attr, value)
-    mock_prompt.ask.side_effect = lambda x, default="": test_input.get(
-        x.split()[-1], ""
-    )
-
-    # Act
-    ProfileCommand.run(mock_cli)
-
-    # Assert
-    mock_write_profile.assert_called_once()
-    assert getattr(mock_cli.config, "name") == expected
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-@pytest.mark.parametrize(
-    "test_input, expected",
-    [
-        (
-            bittensor_config(),
-            True,
-        ),
-        # Edge cases
-        (
-            None,
-            False,
-        ),
-    ],
-)
-def test_check_config(test_input, expected):
-    # Arrange - In this case, all inputs are provided via test parameters, so we omit the Arrange section.
+class ProfileTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load("profile_config_test", ROOT / "bittensor/config.py").config
+        cls.stub = types.ModuleType("bittensor")
+        cls.stub.config = cls.config
+        cls.stub.subtensor = MagicMock()
+        cls.stub.wallet = MagicMock()
+        cls.stub.__networks__ = ["finney", "test"]
+        cls.stub.__finney_entrypoint__ = "wss://entrypoint-finney.opentensor.ai:443"
+        cls.stub.__console__ = MagicMock()
+        cls.commands = types.ModuleType("bittensor.commands")
+        cls.commands.defaults = types.SimpleNamespace(profile=types.SimpleNamespace(name="default", path="~/.bittensor/profiles/"))
+        cls.modules = patch.dict(sys.modules, {"bittensor": cls.stub, "bittensor.commands": cls.commands})
+        cls.modules.start()
+        cls.module = load("bittensor.commands.profile", ROOT / "bittensor/commands/profile.py")
 
-    # Act
-    result = ProfileCommand.check_config(test_input)
+    @classmethod
+    def tearDownClass(cls):
+        cls.modules.stop()
 
-    # Assert
-    assert result == expected
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        cfg = self.config()
+        cfg.profile = self.config()
+        cfg.profile.name, cfg.profile.path, cfg.profile.overwrite = "alice", self.temp.name, False
+        cfg.subtensor = self.config()
+        cfg.subtensor.network, cfg.subtensor.chain_endpoint = "finney", "wss://example.invalid"
+        cfg.wallet = self.config()
+        cfg.wallet.name, cfg.wallet.hotkey, cfg.wallet.path = "default", "hot", "~/.bittensor/wallets"
+        cfg.netuid, cfg.no_prompt = 7, True
+        cfg.private_key = "must-never-be-serialized"
+        self.cli = types.SimpleNamespace(config=cfg)
+        self.stub.__console__.reset_mock()
+        self.stub.subtensor.reset_mock()
+
+    def create(self):
+        self.module.ProfileCommand.run(self.cli)
+        return Path(self.temp.name) / "alice"
+
+    def test_offline_round_trip_without_trailing_slash(self):
+        path = self.create()
+        contents = yaml.safe_load(path.read_text())
+        self.assertEqual(contents["netuid"], 7)
+        self.assertEqual(contents["profile"]["name"], "alice")
+        self.assertNotIn("private_key", contents)
+        self.stub.subtensor.assert_not_called()
+        self.module.ProfileListCommand.run(self.cli)
+        self.module.ProfileShowCommand.run(self.cli)
+        self.assertEqual(len(self.stub.__console__.print.call_args_list), 3)
+
+    def test_no_prompt_does_not_silently_overwrite(self):
+        path = self.create()
+        original = path.read_bytes()
+        self.cli.config.netuid = 9
+        self.create()
+        self.assertEqual(path.read_bytes(), original)
+        self.cli.config.profile.overwrite = True
+        self.create()
+        self.assertEqual(yaml.safe_load(path.read_text())["netuid"], 9)
+
+    def test_atomic_write_failure_preserves_previous_profile(self):
+        path = self.create()
+        original = path.read_bytes()
+        self.cli.config.profile.overwrite = True
+        with patch.object(self.module.os, "replace", side_effect=OSError("fixture failure")):
+            self.create()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(Path(self.temp.name).iterdir()), [path])
+
+    def test_traversal_and_symlink_refused(self):
+        for name in ("../escape", "/absolute", ".", "bad/name"):
+            self.cli.config.profile.name = name
+            self.module.ProfileCommand.run(self.cli)
+        self.assertEqual(list(Path(self.temp.name).iterdir()), [])
+        target = Path(self.temp.name) / "target"
+        target.write_text("unchanged")
+        (Path(self.temp.name) / "alice").symlink_to(target)
+        self.cli.config.profile.name = "alice"
+        self.create()
+        self.assertEqual(target.read_text(), "unchanged")
+
+    def test_invalid_netuid_refused(self):
+        for value in (-1, "abc"):
+            self.cli.config.netuid = value
+            self.create()
+        self.assertEqual(list(Path(self.temp.name).iterdir()), [])
+
+    def test_malformed_or_missing_show_is_graceful(self):
+        path = Path(self.temp.name) / "alice"
+        for text in ("- list\n", "[invalid"):
+            path.write_text(text)
+            self.module.ProfileShowCommand.run(self.cli)
+        path.unlink()
+        self.module.ProfileShowCommand.run(self.cli)
+
+    def test_create_parser_has_netuid_and_overwrite(self):
+        parser = argparse.ArgumentParser()
+        self.module.ProfileCommand.add_args(parser.add_subparsers())
+        parsed = parser.parse_args(["create", "--netuid", "4", "--profile.overwrite"])
+        self.assertEqual(parsed.netuid, 4)
+        self.assertTrue(vars(parsed)["profile.overwrite"])
+
+    def test_interactive_endpoint_uses_value_equality(self):
+        self.cli.config.no_prompt = False
+        self.cli.config.subtensor.chain_endpoint = "".join(["wss://entrypoint-", "finney.opentensor.ai:443"])
+        self.stub.subtensor.determine_chain_endpoint_and_network.return_value = ("test", "wss://test.invalid")
+        values = ["alice", "test", "wss://test.invalid", "default", "hot", "~/.bittensor/wallets", "3"]
+        with patch.object(self.module.Prompt, "ask", side_effect=values):
+            self.create()
+        self.stub.subtensor.determine_chain_endpoint_and_network.assert_called_once_with("test")
+        self.assertEqual(yaml.safe_load((Path(self.temp.name) / "alice").read_text())["netuid"], 3)
 
 
-def test_write_profile():
-    # Create a mock config object with the necessary attributes
-    mock_config = type(
-        "Config",
-        (object,),
-        {
-            "path": "~/.bittensor/profiles/",
-            "name": "test_profile",
-            "coldkey": "xyz123",
-            "hotkey": "abc789",
-            "subtensor_network": "finney",
-            "active_netuid": "123",
-        },
-    )()
-
-    # Setup the mock for os.makedirs and open
-    with patch("os.makedirs") as mock_makedirs, patch(
-        "os.path.expanduser", return_value="/.bittensor/profiles/"
-    ), patch("builtins.open", mock_open()) as mock_file:
-        # Call the function with the mock config
-        ProfileCommand._write_profile(mock_config)
-
-        # Assert that makedirs was called correctly
-        mock_makedirs.assert_called_once_with("/.bittensor/profiles/", exist_ok=True)
-
-        # Assert that open was called correctly; construct the expected file path and contents
-        expected_path = "/.bittensor/profiles/test_profile"
-        expected_contents = (
-            f"name = {mock_config.name}\n"
-            f"coldkey = {mock_config.coldkey}\n"
-            f"hotkey = {mock_config.hotkey}\n"
-            f"subtensor_network = {mock_config.subtensor_network}\n"
-            f"active_netuid = {mock_config.active_netuid}\n"
-        )
-
-        # Assert the open function was called correctly and the right contents were written
-        mock_file.assert_called_once_with(expected_path, "w+")
-        mock_file().write.assert_called_once_with(expected_contents)
+if __name__ == "__main__":
+    unittest.main()
